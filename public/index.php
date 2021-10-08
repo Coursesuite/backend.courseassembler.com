@@ -3,11 +3,11 @@
 // ini_set("display_errors", 1);
 set_time_limit(300);
 
-header ("Access-Control-Allow-Origin: *");
+header ("Access-Control-Allow-Origin: ". getenv("ORIGIN_URL"));
 header ("Access-Control-Allow-Headers: *");
-header ("Access-Control-Allow-Methods: GET, POST, OPTIONS");
+header ("Access-Control-Allow-Methods: POST, OPTIONS");
 
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS' || $_SERVER['REQUEST_METHOD'] === 'GET') {
     die();
 }
 
@@ -22,7 +22,7 @@ use \CloudConvert\CloudConvert;
 use \CloudConvert\Models\Job;
 use \CloudConvert\Models\Task;
 
-$verifier = Licence::validate(Request::get("hash"));
+$verifier = Licence::validate(Request::post("hash"));
 if (!$verifier->valid) Utils::stop(403, '{"error":"forbidden"}');
 
 $fileid     = Request::post("fileid");              // file-kf783op-0
@@ -35,14 +35,31 @@ $upload     = Request::file("blob");
 $upload_filename = $upload ? $upload["tmp_name"] : "";
 
 // https://packagist.org/packages/ralouphie/mimey
+$builder = \Mimey\MimeMappingBuilder::create();
+$builder->add('application/vnd.apple.keynote', 'key');
+$builder->add('application/x-iwork-keynote-sffkey', 'key');
+$builder->add('application/vnd.apple.pages', 'pages');
+$builder->add('application/x-iwork-pages-sffpages', 'pages');
+$builder->add('application/vnd.apple.numbers', 'numbers');
+$builder->add('application/x-iwork-numbers-sffnumbers', 'numbers');
+
 $Mimey = new \Mimey\MimeTypes;
 $mimeext = $Mimey->getExtension($mime);
+
+// AN EXTENSION IS REQUIRED
+if (empty($mimeext)) {
+    $mimeext = pathinfo($name, PATHINFO_EXTENSION);
+}
+
+if (empty($mimeext)) {
+    Utils::Stop(500, '{"error":"The file was not understood or was not valid"}');
+}
 
 // CREATE A WORKING DIR
 $jobsroot = realpath('../jobs');
 $workingdir =  "{$jobsroot}/{$verifier->hash}/{$fileid}/";
 if (!file_exists($workingdir)) mkdir ($workingdir, 0777, true);
-if (!file_exists($workingdir)) Utils::Stop(404, '{"error":"permissions"}');
+if (!file_exists($workingdir)) Utils::Stop(404, '{"error":"Permissions are preventing conversion from taking place"}');
 
 WriteToLog("Job started " . time());
 WriteToLog($_POST);
@@ -51,9 +68,9 @@ WriteToLog($upload);
 // DETERMINE CONVERSION TYPE
 $conversionTarget = $website ? "website" : "html";
 $targetFormats = [
-    "pdf" => ["odd","epub","mobi","lit","pages","numbers","ods","cdr","eps"], // and maybe odt
+    "pdf" => ["odd","epub","mobi","lit","pages","numbers","ods","cdr","eps", "odt","pptx","ppt","key","numbers","pages","doc","docx","xls","xlsx"],
     "jpg" => ["psd","tiff","webp","ps","wps","azw","bmp","nef","raw","xps"],
-    "png" => ["svg"],
+    "png" => ["svg","ai"],
 ];
 
 if (!empty($mimeext)) {
@@ -64,6 +81,7 @@ if (!empty($mimeext)) {
     }
 }
 
+WriteToLog("extension from mime=". $mimeext);
 WriteToLog("conversionTarget=". $conversionTarget);
 
 // SET UP API
@@ -81,7 +99,7 @@ switch ($conversionTarget) {
     case "html":
         $job
             ->addTask(
-                CreateImportTask("{$fileid}-import")
+                CreateImportTask("{$fileid}-import", $url)
             )
             ->addTask(
                 ConvertToHtml("{$fileid}-import", $job_result ,$mimeext)
@@ -91,7 +109,7 @@ switch ($conversionTarget) {
     case "pdf":
         $job
             ->addTask(
-                CreateImportTask("{$fileid}-import")
+                CreateImportTask("{$fileid}-import", $url)
             )
             ->addTask(
                 ConvertToPdf("{$fileid}-import", "{$fileid}-pdf", $mimeext)
@@ -105,7 +123,7 @@ switch ($conversionTarget) {
         $job_result = "{$fileid}-jpg";
         $job
             ->addTask(
-                CreateImportTask("{$fileid}-import")
+                CreateImportTask("{$fileid}-import", $url)
             )
             ->addTask(
                 ConvertToJpg("{$fileid}-import", $job_result, $mimeext)
@@ -116,7 +134,7 @@ switch ($conversionTarget) {
         $job_result = "{$fileid}-png";
         $job
             ->addTask(
-                CreateImportTask("{$fileid}-import")
+                CreateImportTask("{$fileid}-import", $url)
             )
             ->addTask(
                 ConvertToPng("{$fileid}-import", $job_result, $mimeext)
@@ -140,8 +158,12 @@ $job->addTask(CreateExportTask($job_result, $fileid));
 
 // UPLOAD THE JOB
 $CC_API->jobs()->create($job);
-if ($conversionTarget !== "website") {
+if ($conversionTarget === "website" || ($upload === false && !empty($url))) {
+    WriteToLog("Nothing to upload, url=" . $url);
+    // nothing to do
+} else {
     $uploadTask = $job->getTasks()->whereName("{$fileid}-import")[0];
+    WriteToLog("Uploading " . $upload_filename);
     $CC_API->tasks()->upload($uploadTask, fopen($upload_filename, 'r'), $name);
 }
 
@@ -160,16 +182,19 @@ foreach ($job->getExportUrls() as $file) {
     $converted_file_contents = file_get_contents($workingdir . '/' . $file->filename);
 }
 
+if (empty($converted_file_contents)) {
+    Utils::Stop(500, '{"error":"An error occurred converting this file (unsupported)."}');
+}
 
 // CREATE THE FILEINFO PAYLOAD
 $result = new stdClass();
 $result->payload = new stdClass();
-if ($website) {
+if ($website || in_array($conversionTarget, ["jpg","png"])) {
     $result->name = $name;
-    $result->format = 'jpg';
+    $result->format = $conversionTarget;
     $result->kind = 'image';
     $result->source = $url;
-    $result->payload->image = "data:image/jpeg;base64," . base64_encode($converted_file_contents);
+    $result->payload->image = "data:image/" . ($conversionTarget==="jpg" ? "jpeg" : "png") . ";base64," . base64_encode($converted_file_contents);
     $result->payload->name = $name;
     $result->payload->backgroundColor = '#ffffff';
 } else {
@@ -181,9 +206,9 @@ if ($website) {
     $result->src = $src;
 }
 
-
 // WRITE OUTPUT AND STOP
 $json = json_encode($result, JSON_NUMERIC_CHECK | JSON_PARTIAL_OUTPUT_ON_ERROR);
+WriteToLog($json);
 Utils::stop(200, $json, false, 'text/plain', $workingdir);
 
 
@@ -196,8 +221,16 @@ function WriteToLog($contents) {
 
 
 // CLOUD CONVERT TASKS
-function CreateImportTask($output) {
-    $TASK = (new Task('import/upload', $output));
+function CreateImportTask($output, $url = '') {
+    if (empty($url)) {
+        $TASK = (new Task('import/upload', $output));
+        WriteToLog("Task is Upload");
+    } else {
+        $TASK = (new Task('import/url', $output))
+            ->set('url', $url)
+            ->set('filename','output.pdf');
+        WriteToLog("Task is URL");
+    }
     return $TASK;
 }
 
@@ -235,7 +268,8 @@ function CaptureWebsite($url, $output) {
         ->set('screen_width', MAX_WIDTH)
         ->set('fit', 'max')
         ->set('quality', 90)
-        ->set('wait_until', 'load')
+        ->set('timeout', 300)
+        ->set('wait_until', 'networkidle2')
         ->set('wait_time', 0)
         ->set('filename', 'output.jpg');
     return $TASK;
