@@ -3,17 +3,31 @@
 // ini_set("display_errors", 1);
 set_time_limit(300);
 
-header ("Access-Control-Allow-Origin: ". getenv("ORIGIN_URL"));
+// currently powerpoint files are scaled to a width of 1280px
+// a pixel width of 960 requires a scaling factor of 0.75. This is what pptx > pdf uses. pdf > html uses a scaling_factor of 1 which seems to result in the width of 1280.
+// a pixel width of 1920 requires a scaling factory of 1.5
+define('SCALING_FACTOR', 0.75); //  1.5); // found using trial and error
+define("MAX_WIDTH", 1440);
+
+$e = getenv("ORIGIN_URL");
+
+// for local debugging, set the randomised server port here
+//$e = "http://127.0.0.1:" . 57897;
+
+header ("Access-Control-Allow-Origin: ". $e);
 header ("Access-Control-Allow-Headers: *");
 header ("Access-Control-Allow-Methods: POST, OPTIONS");
 
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS' || $_SERVER['REQUEST_METHOD'] === 'GET') {
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS' || $_SERVER['REQUEST_METHOD'] === 'GET' || $_SERVER['REQUEST_METHOD'] === 'PUT') {
     die();
 }
 
 require_once('../vendor/autoload.php');
 
-define("MAX_WIDTH", 1440);
+$bugsnag = Bugsnag\Client::make('8a050b42bcd798011ceef380f768143d');
+Bugsnag\Handler::register($bugsnag);
+
+// $bugsnag->notifyException(new RuntimeException("Test error"));
 
 // $headers = apache_request_headers();
 // header('content-type: application/json');
@@ -21,6 +35,9 @@ define("MAX_WIDTH", 1440);
 use \CloudConvert\CloudConvert;
 use \CloudConvert\Models\Job;
 use \CloudConvert\Models\Task;
+use IvoPetkov\HTML5DOMElement;
+
+$bugsnag->leaveBreadcrumb('Calling out to licence verifier');
 
 $verifier = Licence::validate(Request::post("hash"));
 if (!$verifier->valid) Utils::stop(403, '{"error":"forbidden"}');
@@ -43,8 +60,10 @@ $builder->add('application/x-iwork-pages-sffpages', 'pages');
 $builder->add('application/vnd.apple.numbers', 'numbers');
 $builder->add('application/x-iwork-numbers-sffnumbers', 'numbers');
 
+$bugsnag->leaveBreadcrumb('Callout to file extension handler');
 $Mimey = new \Mimey\MimeTypes;
 $mimeext = $Mimey->getExtension($mime);
+
 
 // AN EXTENSION IS REQUIRED
 if (empty($mimeext)) {
@@ -59,7 +78,13 @@ if (empty($mimeext)) {
 $jobsroot = realpath('../jobs');
 $workingdir =  "{$jobsroot}/{$verifier->hash}/{$fileid}/";
 if (!file_exists($workingdir)) mkdir ($workingdir, 0777, true);
-if (!file_exists($workingdir)) Utils::Stop(404, '{"error":"Permissions are preventing conversion from taking place"}');
+if (!file_exists($workingdir)) {
+    $bugsnag->leaveBreadcrumb(
+        'Permissions are broken on Jobs folder!',
+        \Bugsnag\Breadcrumbs\Breadcrumb::ERROR_TYPE
+    );
+    Utils::Stop(404, '{"error":"Permissions are preventing conversion from taking place"}');
+}
 
 WriteToLog("Job started " . time());
 WriteToLog($_POST);
@@ -84,6 +109,9 @@ if (!empty($mimeext)) {
 WriteToLog("extension from mime=". $mimeext);
 WriteToLog("conversionTarget=". $conversionTarget);
 
+$bugsnag->leaveBreadcrumb('Conversion from ' . $mimeext . ' to ' . $conversionTarget);
+
+
 // SET UP API
 $CC_API = new CloudConvert([
     'api_key' => file_get_contents("../api.key"),
@@ -94,6 +122,8 @@ $CC_API = new CloudConvert([
 // SET UP CONVERSION JOB
 $job = new Job();
 $job_result = "{$fileid}-html";
+
+$bugsnag->leaveBreadcrumb('Job builder started');
 
 switch ($conversionTarget) {
     case "html":
@@ -169,6 +199,7 @@ if ($conversionTarget === "website" || ($upload === false && !empty($url))) {
 
 
 // WAIT FOR CONVERSION
+$bugsnag->leaveBreadcrumb('Waiting on conversion');
 $CC_API->jobs()->wait($job);
 
 
@@ -176,6 +207,7 @@ $CC_API->jobs()->wait($job);
 $converted_file_contents = "";
 foreach ($job->getExportUrls() as $file) {
     WriteToLog($file);
+    $bugsnag->leaveBreadcrumb('Downloading result');
     $source = $CC_API->getHttpTransport()->download($file->url)->detach();
     $dest = fopen($workingdir . '/' . $file->filename, 'w');
     stream_copy_to_stream($source, $dest);
@@ -199,7 +231,7 @@ if ($website || in_array($conversionTarget, ["jpg","png"])) {
     $result->payload->backgroundColor = '#ffffff';
 } else {
     $result->name = pathinfo($name, PATHINFO_FILENAME);
-    $result->payload->html = $converted_file_contents;
+    $result->payload = PostProcessing($upload_filename, $mimeext, $converted_file_contents);
     $result->format = $conversionTarget;
     $result->kind = 'file';
     $result->type = $mime;
@@ -207,10 +239,9 @@ if ($website || in_array($conversionTarget, ["jpg","png"])) {
 }
 
 // WRITE OUTPUT AND STOP
-$json = json_encode($result, JSON_NUMERIC_CHECK | JSON_PARTIAL_OUTPUT_ON_ERROR);
+$json = json_encode($result, JSON_NUMERIC_CHECK); //  | JSON_PARTIAL_OUTPUT_ON_ERROR);
 WriteToLog($json);
-Utils::stop(200, $json, false, 'text/plain', $workingdir);
-
+Utils::stop(200, $json, false, 'application/json', $workingdir);
 
 // UTILITIES
 function WriteToLog($contents) {
@@ -322,4 +353,116 @@ function CreateExportTask($input, $fileid) {
     $TASK = (new Task('export/url', $fileid . '-export'))
         ->set('input', $input);
     return $TASK;
+}
+
+/**
+ * PostProcessing - Performs any modifications to the final output html before being returned to the callee
+ * @param $input string input file
+ * @param #extension string file extension of the input file
+ * @param $output string The html of the conversion output 
+ * @return stdClass - containing the HTML object and any public file references to be returned to the callee
+ */
+function PostProcessing($input, $extension, $html) {
+    $payload = new stdClass();
+    $payload->html = $html;
+    switch ($extension) {
+        case 'pptx':
+            $payload = ConvertPowerpointMedia($input, $html);
+            break;
+    }
+    return $payload;
+}
+
+/**
+ * Takes the original powerpoint file and calculates the position of embedded media and modifies the html to reference the files
+ * @param $filename string The original powerpoint file (uploaded by the user)
+ * @param $html string The html of the conversion output (what cloudconvert gave us)
+ * @return stdClass - an object containing these keys
+ *                    - html - the modified html string. videos are embedded in base64 encoded data-urls
+ *                   - files - an array of file urls that can be downloaded by the callee (e.g. page audio)
+ */
+function ConvertPowerpointMedia($file_reference, $html) {
+    global $bugsnag;
+
+    $bugsnag->leaveBreadcrumb('ConvertPowerpointMedia');
+    WriteToLog("ConvertPowerpointMedia called");
+
+    $result = new stdClass();
+    $result->html = $html;
+    $modifed = false;
+
+    $ppt = new PPTLoader(SCALING_FACTOR);
+    $ppt->load($file_reference);
+    $pptSlides = $ppt->getSlides();
+    // file_put_contents($workingdir . '/slides.txt', var_export($pptSlides, true));
+
+    // data returned looks like this. slides are 1-based
+    // {
+    //     "slide1.xml": {
+    //         "baseFile": "slide1.xml", // this slide has no media key so it can be ignored
+    //     },
+    //     "slide2.xml": {
+    //         "name": string,
+    //         "title": string,
+    //         "extn": mp4 | empty,
+    //         "x": float,          // values need to be scaled by 1.5 to match the coolwanglu output size
+    //         "y": float,
+    //         "width": float,
+    //         "height": float,
+    //         "type": mime/type | youtube | vimeo | external
+    //         "media": data:mime/type;base64,... | youtube-embed | vimeo-embed | external-url
+    //     }
+    // }
+
+    // we need to load the html and then go through each slide and add the media as per the above
+    $dom = new IvoPetkov\HTML5DOMDocument();
+    $dom->loadHTML($html);
+    $container = $dom->querySelector("#page-container");
+    $slides = $container->querySelectorAll("div[data-page-no]");
+    foreach ($slides as $slide) {
+        $slide_no = $slide->getAttribute("data-page-no");
+        $slide_no = intval($slide_no);
+        $xml = $pptSlides["slide" . $slide_no . ".xml"];
+        if (property_exists($xml, "media")) {
+            WriteToLog("Modifying slide " . $slide_no . "; type=" . $xml->type);
+            $modifed = true;
+            $pc = $slide->querySelector(".pc");
+            $style = "" .
+                "position: absolute; " .
+                "top: " . $xml->y . "px; " .
+                "left: " . $xml->x . "px; " .
+                "width: " . $xml->width . "px; " .
+                "height: " . $xml->height . "px; " .
+                "";
+            if ($xml->type === "youtube" || $xml->type === "vimeo") {
+                $element = $dom->createElement("iframe");
+                $element->setAttribute("src", $xml->media);
+                $element->setAttribute("style",$style);
+                $element->setAttribute("frameborder", 0);
+                $element->setAttribute("title", $xml->title);
+                $element->setAttribute("allow", "autoplay *; encrypted-media; fullscreen *");
+                $pc->appendChild($element);
+            } else if ($xml->type === "external" || strpos($xml->type, "video/") !== false) {
+                $element = $dom->createElement("video");
+                $element->setAttribute("src", $xml->media);
+                $element->setAttribute("controls", "controls");
+                $element->setAttribute("style", $style);
+                $pc->appendChild($element);
+            } else if (strpos($xml->type, "audio/") !== false) {
+                // the audio file is per slide, but we are returning unsplit document.
+                // so we might return multple audios that need to be attached to the new storage elemnts for each page
+                $result->audio["s".$slide_no] = $xml->media;
+            }
+        }
+    }
+
+    // only modify the html if any slides had media
+    if ($modifed) {
+        $result->html = $dom->saveHTML();
+        // file_put_contents($workingdir . '/modified.html', $result->html);
+    }
+
+    // becomes the payload object
+    return $result;
+
 }
