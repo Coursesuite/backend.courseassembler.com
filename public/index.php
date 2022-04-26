@@ -422,6 +422,7 @@ function ConvertPowerpointMedia($file_reference, $html) {
     foreach ($slides as $slide) {
         $slide_no = $slide->getAttribute("data-page-no");
         $slide_no = intval($slide_no);
+        if ($slide_no === 0) continue; // no such index
         $xml = $pptSlides["slide" . $slide_no . ".xml"];
         if (property_exists($xml, "media")) {
             WriteToLog("Modifying slide " . $slide_no . "; type=" . $xml->type);
