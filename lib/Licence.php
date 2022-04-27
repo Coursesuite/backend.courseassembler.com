@@ -61,7 +61,7 @@ class Licence extends Controller {
 		}
 		$record = new LicenceModel('licencekey', $key);
 		if ($record->loaded()) {
-			if ($record->ends < time()) {
+			if ($record->ends > 0 && $record->ends < time()) {
 				$result->valid = false;
 				$result->licence->error = "licence-key-expired";
 			} else {
