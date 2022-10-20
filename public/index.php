@@ -12,7 +12,7 @@ define("MAX_WIDTH", 1440);
 $e = getenv("ORIGIN_URL");
 
 // for local debugging, set the randomised server port here
-//$e = "http://127.0.0.1:" . 57897;
+// $e = "http://127.0.0.1:" . 55249;
 
 header ("Access-Control-Allow-Origin: ". $e);
 header ("Access-Control-Allow-Headers: *");
@@ -50,6 +50,8 @@ $website    = (Request::post("website") === "true");
 $src        = Request::post("src");
 $upload     = Request::file("blob");
 $upload_filename = $upload ? $upload["tmp_name"] : "";
+$upload_size = $upload ? $upload["size"] : 0;
+$upload_name = $upload ? $upload["name"] : "";
 
 // https://packagist.org/packages/ralouphie/mimey
 $builder = \Mimey\MimeMappingBuilder::create();
@@ -96,6 +98,8 @@ $targetFormats = [
     "pdf" => ["odd","epub","mobi","lit","pages","numbers","ods","cdr","eps", "odt","pptx","ppt","key","numbers","pages","doc","docx","xls","xlsx"],
     "jpg" => ["psd","tiff","webp","ps","wps","azw","bmp","nef","raw","xps"],
     "png" => ["svg","ai"],
+    "mp3" => ["m4a","wav","ogg"],
+    "mp4" => ["m4v","mov","avi","mkv","wmv","flv","webm"],
 ];
 
 if (!empty($mimeext)) {
@@ -179,6 +183,28 @@ switch ($conversionTarget) {
             );
     break;
 
+    case "mp3":
+        $job_result = "{$fileid}-mp3";
+        $job
+            ->addTask(
+                CreateImportTask("{$fileid}-import", $url)
+            )
+            ->addTask(
+                ConvertToMp3("{$fileid}-import", $job_result, $mimeext)
+            );
+    break;
+
+    case "mp4":
+        $job_result = "{$fileid}-mp4";
+        $job
+            ->addTask(
+                CreateImportTask("{$fileid}-import", $url)
+            )
+            ->addTask(
+                ConvertToMp4("{$fileid}-import", $job_result, $mimeext)
+            );
+    break;
+
 }
 
 
@@ -193,25 +219,34 @@ if ($conversionTarget === "website" || ($upload === false && !empty($url))) {
     // nothing to do
 } else {
     $uploadTask = $job->getTasks()->whereName("{$fileid}-import")[0];
-    WriteToLog("Uploading " . $upload_filename);
+    WriteToLog("Uploading {$upload_filename} ({$upload_size} bytes)");
     $CC_API->tasks()->upload($uploadTask, fopen($upload_filename, 'r'), $name);
+
+    // debug
+    if (in_array($conversionTarget, ["mp3","mp4"])) {
+        move_uploaded_file($upload_filename, $workingdir . '/' . $upload_name);
+    }
+
 }
 
 
 // WAIT FOR CONVERSION
 $bugsnag->leaveBreadcrumb('Waiting on conversion');
+WriteToLog('Waiting on conversion');
 $CC_API->jobs()->wait($job);
 
 
 // DOWNLOAD THE RESULTS
 $converted_file_contents = "";
+$converted_file_name = "";
 foreach ($job->getExportUrls() as $file) {
     WriteToLog($file);
     $bugsnag->leaveBreadcrumb('Downloading result');
     $source = $CC_API->getHttpTransport()->download($file->url)->detach();
-    $dest = fopen($workingdir . '/' . $file->filename, 'w');
+    $converted_file_name = $file->filename;
+    $dest = fopen($workingdir . '/' . $converted_file_name, 'w');
     stream_copy_to_stream($source, $dest);
-    $converted_file_contents = file_get_contents($workingdir . '/' . $file->filename);
+    $converted_file_contents = file_get_contents($workingdir . '/' . $converted_file_name);
 }
 
 if (empty($converted_file_contents)) {
@@ -229,6 +264,20 @@ if ($website || in_array($conversionTarget, ["jpg","png"])) {
     $result->payload->image = "data:image/" . ($conversionTarget==="jpg" ? "jpeg" : "png") . ";base64," . base64_encode($converted_file_contents);
     $result->payload->name = $name;
     $result->payload->backgroundColor = '#ffffff';
+
+} elseif (in_array($conversionTarget, ["mp3","mp4"])) {
+    // write the file data directly to the response
+    $outputname = $converted_file_name; // 'output.' . $conversionTarget;
+    $outputpath = $workingdir . '/' . $outputname;
+    header('Content-Disposition: attachment; filename=' . $outputname . ';');
+    header('Content-Type: ' . ($conversionTarget === 'mp3' ? 'audio/mp3' : 'video/mp4'));
+    header('Content-Length: ' . filesize($outputpath));
+    ob_end_flush(); // ensure that any buffered output has been cleared
+    $fp = fopen($outputpath, 'rb');
+    fpassthru($fp);
+    fclose($fp);
+    exit;
+
 } else {
     $result->name = pathinfo($name, PATHINFO_FILENAME);
     $result->payload = PostProcessing($upload_filename, $mimeext, $converted_file_contents);
@@ -346,6 +395,34 @@ function ConvertToPng($input, $output, $format) {
         ->set('input', [$input])
         ->set('pixel_density', 96)
         ->set('filename', 'output.png');
+    return $TASK;
+}
+
+function ConvertToMp3($input, $output, $format) {
+    $TASK = (new Task('convert', $output))
+        ->set('input', [$input])
+        ->set('output_format', 'mp3');
+        // ->set('input_format', $format)
+        // ->set('engine', 'ffmpeg')
+        // ->set('audio_codec', 'mp3')
+        // ->set('audio_qscale', 0)
+        // ->set('filename', 'output.mp3');
+    return $TASK;
+}
+
+function ConvertToMp4($input, $output, $format) {
+    $TASK = (new Task('convert', $output))
+        // ->set('input_format', $format)
+        ->set('input', [$input])
+        ->set('output_format', 'mp4');
+        // ->set('engine', 'ffmpeg')
+        // ->set('video_codec', 'x264')
+        // ->set('crf', 23)
+        // ->set('preset', 'fast')
+        // ->set('subtitles_mode', 'none')
+        // ->set('audio_codec', 'aac')
+        // ->set('audio_bitrate', 128)
+        // ->set('filename', 'output.mp4');
     return $TASK;
 }
 
