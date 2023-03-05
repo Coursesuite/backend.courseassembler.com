@@ -12,7 +12,8 @@ define("MAX_WIDTH", 1440);
 $e = getenv("ORIGIN_URL");
 
 // for local debugging, set the randomised server port here
-// $e = "http://127.0.0.1:" . 55249;
+// $e = "http://127.0.0.1:" . 64254;
+ $e = "http://127.0.0.1:62870";
 
 header ("Access-Control-Allow-Origin: ". $e);
 header ("Access-Control-Allow-Headers: *");
@@ -72,7 +73,13 @@ if (empty($mimeext)) {
     $mimeext = pathinfo($name, PATHINFO_EXTENSION);
 }
 
+WriteToLog(time(), false);
+WriteToLog("Job started ");
+WriteToLog($_POST, false);
+WriteToLog($upload);
+
 if (empty($mimeext)) {
+    WriteToLog("Job failed");
     Utils::Stop(500, '{"error":"The file was not understood or was not valid"}');
 }
 
@@ -88,9 +95,6 @@ if (!file_exists($workingdir)) {
     Utils::Stop(404, '{"error":"Permissions are preventing conversion from taking place"}');
 }
 
-WriteToLog("Job started " . time());
-WriteToLog($_POST);
-WriteToLog($upload);
 
 // DETERMINE CONVERSION TYPE
 $conversionTarget = $website ? "website" : "html";
@@ -110,10 +114,10 @@ if (!empty($mimeext)) {
     }
 }
 
-WriteToLog("extension from mime=". $mimeext);
-WriteToLog("conversionTarget=". $conversionTarget);
-
-$bugsnag->leaveBreadcrumb('Conversion from ' . $mimeext . ' to ' . $conversionTarget);
+// WriteToLog("extension from mime=". $mimeext);
+// WriteToLog("conversionTarget=". $conversionTarget);
+WriteToLog('Conversion from ' . $mimeext . ' to ' . $conversionTarget);
+$bugsnag->leaveBreadcrumb("Conversion from '" . $mimeext . "' to '" . $conversionTarget . "'");
 
 
 // SET UP API
@@ -289,14 +293,28 @@ if ($website || in_array($conversionTarget, ["jpg","png"])) {
 
 // WRITE OUTPUT AND STOP
 $json = json_encode($result, JSON_NUMERIC_CHECK); //  | JSON_PARTIAL_OUTPUT_ON_ERROR);
-WriteToLog($json);
+WriteToLog($json, false);
 Utils::stop(200, $json, false, 'application/json', $workingdir);
 
 // UTILITIES
-function WriteToLog($contents) {
-    global $workingdir;
-    if (gettype($contents) !== "string") $contents = var_export($contents, true);
-    file_put_contents($workingdir . '/log.txt', $contents . PHP_EOL, FILE_APPEND);
+function WriteToLog($contents, $db = true) {
+    global $workingdir, $verifier, $fileid;
+    $msg = $contents;
+
+    if (gettype($contents) !== "string") {
+      //   $contents = var_export($contents, true);
+        $msg = serialize($msg);
+    }
+    // file_put_contents($workingdir . '/log.txt', $contents . PHP_EOL, FILE_APPEND);
+
+    if ($db) {
+        $entry = new dbRow("backend");
+        $entry->licencekey = $verifier->hash;
+        $entry->fileid = $fileid;
+        $entry->message = $msg;
+        $entry->save();
+    }
+
 }
 
 
@@ -537,7 +555,8 @@ function ConvertPowerpointMedia($file_reference, $html) {
     // only modify the html if any slides had media
     if ($modifed) {
         $result->html = $dom->saveHTML();
-        // file_put_contents($workingdir . '/modified.html', $result->html);
+     //   global $workingdir;
+     //   file_put_contents($workingdir . '/modified.html', $result->html);
     }
 
     // becomes the payload object
