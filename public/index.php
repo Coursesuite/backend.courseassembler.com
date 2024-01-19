@@ -13,7 +13,7 @@ $e = getenv("ORIGIN_URL");
 
 // for local debugging, set the randomised server port here
 // $e = "http://127.0.0.1:" . 64254;
- $e = "http://127.0.0.1:62870";
+// $e = "http://127.0.0.1:50974";
 
 header ("Access-Control-Allow-Origin: ". $e);
 header ("Access-Control-Allow-Headers: *");
